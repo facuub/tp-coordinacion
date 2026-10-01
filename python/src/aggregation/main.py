@@ -1,6 +1,6 @@
 import os
 import logging
-import bisect
+import signal
 
 from common import middleware, message_protocol, fruit_item
 
@@ -23,47 +23,57 @@ class AggregationFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
-        self.fruit_top = []
+        self.amount_by_fruit_by_client = {}
+        self.records_by_client = {}
+        self.controls_by_client = {}
 
-    def _process_data(self, fruit, amount):
-        logging.info("Processing data message")
-        for i in range(len(self.fruit_top)):
-            if self.fruit_top[i].fruit == fruit:
-                self.fruit_top[i] = self.fruit_top[i] + fruit_item.FruitItem(
-                    fruit, amount
-                )
-                return
-        bisect.insort(self.fruit_top, fruit_item.FruitItem(fruit, amount))
-
-    def _process_eof(self):
-        logging.info("Received EOF")
-        fruit_chunk = list(self.fruit_top[-TOP_SIZE:])
-        fruit_chunk.reverse()
-        fruit_top = list(
-            map(
-                lambda fruit_item: (fruit_item.fruit, fruit_item.amount),
-                fruit_chunk,
+    def _send_top(self, client_id):
+        logging.info(f"Sending partial top for client {client_id}")
+        amount_by_fruit = self.amount_by_fruit_by_client.pop(client_id)
+        del self.records_by_client[client_id]
+        del self.controls_by_client[client_id]
+        fruit_top = sorted(amount_by_fruit.values(), reverse=True)[:TOP_SIZE]
+        self.output_queue.send(
+            message_protocol.internal.serialize(
+                [client_id, [[item.fruit, item.amount] for item in fruit_top]]
             )
         )
-        self.output_queue.send(message_protocol.internal.serialize(fruit_top))
-        del self.fruit_top
 
     def process_messsage(self, message, ack, nack):
-        logging.info("Process message")
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 2:
-            self._process_data(*fields)
-        else:
-            self._process_eof()
+        [client_id, total, records, is_control, fruits] = (
+            message_protocol.internal.deserialize(message)
+        )
+        amount_by_fruit = self.amount_by_fruit_by_client.setdefault(client_id, {})
+        for fruit, amount in fruits:
+            amount_by_fruit[fruit] = amount_by_fruit.get(
+                fruit, fruit_item.FruitItem(fruit, 0)
+            ) + fruit_item.FruitItem(fruit, amount)
+        self.records_by_client[client_id] = (
+            self.records_by_client.get(client_id, 0) + records
+        )
+        self.controls_by_client[client_id] = self.controls_by_client.get(
+            client_id, 0
+        ) + int(is_control)
+        if (
+            self.controls_by_client[client_id] == SUM_AMOUNT
+            and self.records_by_client[client_id] == total
+        ):
+            self._send_top(client_id)
         ack()
+
+    def stop(self):
+        self.input_exchange.stop_consuming()
 
     def start(self):
         self.input_exchange.start_consuming(self.process_messsage)
+        self.input_exchange.close()
+        self.output_queue.close()
 
 
 def main():
     logging.basicConfig(level=logging.INFO)
     aggregation_filter = AggregationFilter()
+    signal.signal(signal.SIGTERM, lambda signum, frame: aggregation_filter.stop())
     aggregation_filter.start()
     return 0
 
